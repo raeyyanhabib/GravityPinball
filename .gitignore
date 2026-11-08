@@ -1,0 +1,4 @@
+.godot/
+*.keystore
+*.jks
+export_presets.cfg
