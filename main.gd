@@ -5,11 +5,19 @@ const H := 1920.0
 const CHUNK_H := 600.0
 const BAR_H := 40.0
 const GAP_W := 220.0
-const SCROLL_SPEED := 120.0
+const SCROLL_SPEED := 60.0
 const BALL_START := Vector2(540, 300)
+const FLIPPER_Y := 1700.0
+const TILT_DEAD := 0.6     # ignore small tremors (m/s²)
+const TILT_FULL := 4.0     # this much tilt gives full steering (m/s²)
+const TILT_SMOOTH := 0.15  # lower = smoother, slower to respond
 
 var ball: Ball
 var chunks: Array = []
+var left_flipper: Flipper
+var right_flipper: Flipper
+var tilt_smoothed := 0.0
+var touches := {}  # touch index -> screen position
 
 func _ready() -> void:
 	randomize()
@@ -20,7 +28,57 @@ func _ready() -> void:
 	ball.position = BALL_START
 	add_child(ball)
 
+	left_flipper = Flipper.new()
+	left_flipper.is_left = true
+	left_flipper.position = Vector2(200, FLIPPER_Y)
+	add_child(left_flipper)
+
+	right_flipper = Flipper.new()
+	right_flipper.is_left = false
+	right_flipper.position = Vector2(W - 200, FLIPPER_Y)
+	add_child(right_flipper)
+
+func _input(event: InputEvent) -> void:
+	if event is InputEventScreenTouch:
+		if event.pressed:
+			touches[event.index] = event.position
+		else:
+			touches.erase(event.index)
+	elif event is InputEventScreenDrag:
+		touches[event.index] = event.position
+	elif event is InputEventMouseButton:
+		if event.pressed:
+			touches[-1] = event.position
+		else:
+			touches.erase(-1)
+	elif event is InputEventMouseMotion and touches.has(-1):
+		touches[-1] = event.position
+
 func _physics_process(delta: float) -> void:
+	# Tilt: phone accelerometer, or A and D on the laptop
+	var raw := Input.get_gravity().x
+	if abs(raw) < TILT_DEAD:
+		raw = 0.0
+	var key := 0.0
+	if Input.is_physical_key_pressed(KEY_A):
+		key -= 1.0
+	if Input.is_physical_key_pressed(KEY_D):
+		key += 1.0
+	var target_tilt := clampf(raw / TILT_FULL + key, -1.0, 1.0)
+	tilt_smoothed = lerpf(tilt_smoothed, target_tilt, TILT_SMOOTH)
+	ball.tilt = tilt_smoothed
+
+	# Flippers: Z and / on the laptop, left and right screen halves on touch
+	var left_down := Input.is_physical_key_pressed(KEY_Z)
+	var right_down := Input.is_physical_key_pressed(KEY_SLASH)
+	for pos in touches.values():
+		if pos.x < W / 2.0:
+			left_down = true
+		else:
+			right_down = true
+	left_flipper.pressed = left_down
+	right_flipper.pressed = right_down
+
 	# Scroll every chunk upward
 	for c in chunks:
 		c.position.y -= SCROLL_SPEED * delta
