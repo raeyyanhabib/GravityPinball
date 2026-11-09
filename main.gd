@@ -141,5 +141,5 @@ func _add_rect(parent: Node2D, x: float, y: float, w: float, h: float) -> void:
 	var visual := ColorRect.new()
 	visual.position = Vector2(x, y)
 	visual.size = Vector2(w, h)
-	visual.color = Color(0.3, 0.5, 1.0)
+	visual.color = Color("#2a3a5c")
 	parent.add_child(visual)

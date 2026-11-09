@@ -30,4 +30,4 @@ func _physics_process(delta: float) -> void:
 	queue_redraw()
 
 func _draw() -> void:
-	draw_rect(Rect2(0.0, -THICK / 2.0, LEN, THICK), Color(1.0, 0.7, 0.28))
+	draw_rect(Rect2(0.0, -THICK / 2.0, LEN, THICK), Color("#4fd1c5"))

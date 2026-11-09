@@ -26,4 +26,4 @@ func _physics_process(_delta: float) -> void:
 		linear_velocity = linear_velocity.limit_length(MAX_SPEED)
 
 func _draw() -> void:
-	draw_circle(Vector2.ZERO, RADIUS, Color.WHITE)
+	draw_circle(Vector2.ZERO, RADIUS, Color("#f2f4f8"))
