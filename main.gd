@@ -10,8 +10,6 @@ const GAP_MAX := 300.0
 const FLIPPER_Y := 1700.0
 const BALL_START := Vector2(540, 400)
 const DEFAULT_GRAVITY := 0.3
-
-# Bar colors per gravity zone: teal = floaty, slate = normal, red = heavy
 const ZONE_COLORS := {0.15: "#2f5d62", 0.3: "#2a3a5c", 0.5: "#5c2f3a"}
 
 # ---- Speed tuning ----
@@ -23,6 +21,9 @@ const DRIVER_CAP := 180.0
 const TILT_DEAD := 0.6
 const TILT_FULL := 4.0
 const TILT_SMOOTH := 0.15
+# On-screen steer buttons, used in Buttons mode
+const STEER_LEFT_RECT := Rect2(0, 1440, 300, 200)
+const STEER_RIGHT_RECT := Rect2(780, 1440, 300, 200)
 
 # ---- Collision layers ----
 const LAYER_WORLD := 1
@@ -40,12 +41,16 @@ const KICK_SPEED := 260.0
 const GRACE_TIME := 1.2
 const LIFE_COOLDOWN := 1.0
 
+const BALL_STYLES := ["off_white", "silver", "black", "white"]
+
+# ---- Saved settings (loaded in _ready) ----
+var settings: Dictionary = {}
+
 # ---- Game state ----
-var hard_mode := false
+var state := "menu"             # "menu", "play", or "paused"
 var lives := 3
-var game_over := false
 var time_played := 0.0
-var obstacles_passed := 0
+var obstacles_passed := 0       # also the score
 var current_scroll_speed := BASE_SPEED
 
 # ---- Runtime ----
@@ -54,7 +59,7 @@ var chunks: Array = []
 var left_flipper: Flipper
 var right_flipper: Flipper
 var tilt_smoothed := 0.0
-var touches := {}
+var touches := {}               # finger index -> position (-1 = mouse)
 var left_down := false
 var right_down := false
 var wedge_timer := 0.0
@@ -62,9 +67,18 @@ var grace_timer := 0.0
 var break_timer := 0.0
 var life_cooldown := 0.0
 var hud: Label
+var menu_layer: CanvasLayer
+var title_label: Label
+var status_label: Label
+var best_label: Label
+var play_btn: Button
+var mode_btn: Button
+var controls_btn: Button
+var ball_btn: Button
 
 func _ready() -> void:
 	randomize()
+	settings = SettingsStore.load_settings()
 	_make_walls()
 
 	# Fill the screen, starting one chunk above the top
@@ -74,6 +88,8 @@ func _ready() -> void:
 	ball = Ball.new()
 	ball.collision_mask = LAYER_WORLD | LAYER_BARS
 	add_child(ball)
+	ball.set_style(settings.ball)
+	ball.attach()               # frozen while the menu is open
 
 	left_flipper = Flipper.new()
 	left_flipper.is_left = true
@@ -91,15 +107,17 @@ func _ready() -> void:
 	hud.add_theme_color_override("font_color", Color("#f2f4f8"))
 	add_child(hud)
 
-	_restart()
+	_build_menu()
+	_show_menu("")
 
-# Touch, click, and key input
+# Touch, click, key, and pause input
 func _input(event: InputEvent) -> void:
-	# After game over, R or a tap restarts
-	if game_over and event.is_pressed():
-		if (event is InputEventKey and event.keycode == KEY_R) \
-				or event is InputEventScreenTouch or event is InputEventMouseButton:
-			_restart()
+	# P pauses and resumes during play
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_P:
+		if state == "play":
+			state = "paused"
+		elif state == "paused":
+			state = "play"
 		return
 
 	# Track each finger, and the mouse as index -1
@@ -118,9 +136,9 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventMouseMotion and touches.has(-1):
 		touches[-1] = event.position
 
-# Main loop, runs 60 times per second
+# Main loop, 60 times per second
 func _physics_process(delta: float) -> void:
-	if game_over:
+	if state != "play":
 		_update_hud()
 		return
 
@@ -142,33 +160,61 @@ func _physics_process(delta: float) -> void:
 		if ball.position.y <= Ball.RADIUS:
 			_lose_life()
 
+	queue_redraw()              # redraws the steer buttons
 	_update_hud()
 
-# Phone tilt, or A and D on the laptop
+func _draw() -> void:
+	# Faint steer buttons, only in Buttons mode during play
+	if state != "play" or settings.controls != "buttons":
+		return
+	draw_rect(STEER_LEFT_RECT, Color(1, 1, 1, 0.08))
+	draw_rect(STEER_RIGHT_RECT, Color(1, 1, 1, 0.08))
+
+# Steering: phone tilt, or on-screen buttons. A and D work on the laptop.
 func _read_tilt() -> void:
-	var raw := Input.get_gravity().x
-	if abs(raw) < TILT_DEAD:
-		raw = 0.0
 	var key := 0.0
 	if Input.is_physical_key_pressed(KEY_A):
 		key -= 1.0
 	if Input.is_physical_key_pressed(KEY_D):
 		key += 1.0
-	var target_tilt := clampf(raw / TILT_FULL + key, -1.0, 1.0)
-	tilt_smoothed = lerpf(tilt_smoothed, target_tilt, TILT_SMOOTH)
+
+	var source := 0.0
+	if settings.controls == "buttons":
+		var right_held := 1.0 if _held_in(STEER_RIGHT_RECT) else 0.0
+		var left_held := 1.0 if _held_in(STEER_LEFT_RECT) else 0.0
+		source = right_held - left_held
+	else:
+		var raw := Input.get_gravity().x
+		if abs(raw) < TILT_DEAD:
+			raw = 0.0
+		source = raw / TILT_FULL
+
+	var target := clampf(source + key, -1.0, 1.0)
+	tilt_smoothed = lerpf(tilt_smoothed, target, TILT_SMOOTH)
 	ball.tilt = tilt_smoothed
 
-# Z and / on the laptop, screen halves on touch
+# Flippers: Z and / on the laptop, screen halves on touch.
+# In Buttons mode, touches on the steer buttons don't flip.
 func _read_flippers() -> void:
 	left_down = Input.is_physical_key_pressed(KEY_Z)
 	right_down = Input.is_physical_key_pressed(KEY_SLASH)
 	for pos in touches.values():
+		if settings.controls == "buttons":
+			if STEER_LEFT_RECT.has_point(pos) or STEER_RIGHT_RECT.has_point(pos):
+				continue
 		if pos.x < W / 2.0:
 			left_down = true
 		else:
 			right_down = true
 	left_flipper.pressed = left_down
 	right_flipper.pressed = right_down
+
+# True if any finger or the mouse is inside the rect
+func _held_in(rect: Rect2) -> bool:
+	for pos in touches.values():
+		if rect.has_point(pos):
+			return true
+	return false
 
 # Decide whether the ball is stuck against a bar
 func _check_wedge(delta: float) -> void:
@@ -214,21 +260,110 @@ func _break_free() -> void:
 	grace_timer = GRACE_TIME
 	break_timer = 0.0
 
-# Lose a life, then respawn or end the game
+# Lose a life, then respawn, or end the run on the last one
 func _lose_life() -> void:
 	if not PinballLogic.can_lose_life(life_cooldown):
 		return
 	life_cooldown = LIFE_COOLDOWN
 	lives -= 1
 	if lives <= 0:
-		game_over = true
-		ball.release(Vector2.ZERO)
+		_end_run()
 		return
 	_respawn_ball()
 
+# Save the best score for this mode and return to the menu
+func _end_run() -> void:
+	var mode: String = settings.mode
+	if obstacles_passed > int(settings.best[mode]):
+		settings.best[mode] = obstacles_passed
+	SettingsStore.save_settings(settings)
+	ball.attach()               # freeze the ball behind the menu
+	_show_menu("GAME OVER\nScore: %d" % obstacles_passed)
+
+# Show the menu, with an optional message at the top
+func _show_menu(message: String) -> void:
+	state = "menu"
+	menu_layer.visible = true
+	status_label.text = message
+	_refresh_menu()
+
+func _on_play() -> void:
+	menu_layer.visible = false
+	state = "play"
+	_restart()
+
+func _on_mode() -> void:
+	settings.mode = "hard" if settings.mode == "simple" else "simple"
+	_save_and_refresh()
+
+func _on_controls() -> void:
+	settings.controls = "buttons" if settings.controls == "tilt" else "tilt"
+	_save_and_refresh()
+
+func _on_ball() -> void:
+	var i := BALL_STYLES.find(settings.ball)
+	settings.ball = BALL_STYLES[(i + 1) % BALL_STYLES.size()]
+	ball.set_style(settings.ball)
+	_save_and_refresh()
+
+func _save_and_refresh() -> void:
+	SettingsStore.save_settings(settings)
+	_refresh_menu()
+
+func _refresh_menu() -> void:
+	mode_btn.text = "Mode: %s" % String(settings.mode).capitalize()
+	controls_btn.text = "Controls: %s" % ("Tilt" if settings.controls == "tilt" else "Buttons")
+	ball_btn.text = "Ball: %s" % String(settings.ball).replace("_", " ").capitalize()
+	best_label.text = "Best (Simple): %d    Best (Hard): %d" % [
+		int(settings.best.simple), int(settings.best.hard)]
+
+# Build the menu UI once, then show or hide it
+func _build_menu() -> void:
+	menu_layer = CanvasLayer.new()
+	add_child(menu_layer)
+
+	var box := VBoxContainer.new()
+	box.position = Vector2(200, 480)
+	box.custom_minimum_size = Vector2(680, 0)
+	box.add_theme_constant_override("separation", 20)
+	menu_layer.add_child(box)
+
+	title_label = Label.new()
+	title_label.text = "GRAVITY PINBALL"
+	title_label.add_theme_font_size_override("font_size", 64)
+	title_label.add_theme_color_override("font_color", Color("#f2f4f8"))
+	title_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(title_label)
+
+	status_label = Label.new()
+	status_label.add_theme_font_size_override("font_size", 40)
+	status_label.add_theme_color_override("font_color", Color("#f6ad55"))
+	status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(status_label)
+
+	play_btn = _make_button(box, "Play", _on_play)
+	mode_btn = _make_button(box, "", _on_mode)
+	controls_btn = _make_button(box, "", _on_controls)
+	ball_btn = _make_button(box, "", _on_ball)
+
+	best_label = Label.new()
+	best_label.add_theme_font_size_override("font_size", 34)
+	best_label.add_theme_color_override("font_color", Color("#9aa3c7"))
+	best_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(best_label)
+
+func _make_button(parent: Control, text: String, callback: Callable) -> Button:
+	var b := Button.new()
+	b.text = text
+	b.custom_minimum_size = Vector2(680, 96)
+	b.add_theme_font_size_override("font_size", 40)
+	b.pressed.connect(callback)
+	parent.add_child(b)
+	return b
+
+# Start a fresh run with the chosen mode
 func _restart() -> void:
-	lives = 1 if hard_mode else 3
-	game_over = false
+	lives = 1 if settings.mode == "hard" else 3
 	life_cooldown = 0.0
 	time_played = 0.0
 	obstacles_passed = 0
@@ -276,10 +411,14 @@ func _gravity_at_ball() -> float:
 	return PinballLogic.gravity_at(ball.position.y, zones, CHUNK_H, DEFAULT_GRAVITY)
 
 func _update_hud() -> void:
-	if game_over:
-		hud.text = "GAME OVER\nTap or press R to restart"
+	if state == "menu":
+		hud.text = ""
 		return
-	var text := "Lives: %d | Speed: %d" % [lives, int(current_scroll_speed)]
+	if state == "paused":
+		hud.text = "PAUSED (press P to resume)"
+		return
+	var text := "Lives: %d | Speed: %d | Score: %d" % [
+		lives, int(current_scroll_speed), obstacles_passed]
 	if ball.attached:
 		var window := PinballLogic.escape_window(ball.position.y, current_scroll_speed)
 		text += "\nESCAPE: %.1fs" % window
