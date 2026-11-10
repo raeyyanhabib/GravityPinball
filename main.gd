@@ -9,6 +9,7 @@ const GAP_MIN := 180.0
 const GAP_MAX := 300.0
 const FLIPPER_Y := 1700.0
 const BALL_START := Vector2(540, 400)
+const PARK_POS := Vector2(-500, -500)   # where the ball waits while the menu is open
 const DEFAULT_GRAVITY := 0.3
 const ZONE_COLORS := {0.15: "#2f5d62", 0.3: "#2a3a5c", 0.5: "#5c2f3a"}
 
@@ -33,7 +34,6 @@ const LAYER_BARS := 2
 const WEDGE_SPEED := 25.0
 const WARN_TIME := 0.8
 const WEDGE_TIME := 1.6
-const PIN_MIN_Y := 700.0
 const STRUGGLE_SPEED := 140.0
 const BREAK_HOLD := 0.25
 const BREAK_TILT := 0.6
@@ -86,10 +86,9 @@ func _ready() -> void:
 		_spawn_chunk(i * CHUNK_H)
 
 	ball = Ball.new()
-	ball.collision_mask = LAYER_WORLD | LAYER_BARS
 	add_child(ball)
 	ball.set_style(settings.ball)
-	ball.attach()               # frozen while the menu is open
+	_park_ball()                # hidden and inactive while the menu is open
 
 	left_flipper = Flipper.new()
 	left_flipper.is_left = true
@@ -156,12 +155,22 @@ func _physics_process(delta: float) -> void:
 		_carry_ball(delta)
 	else:
 		_check_wedge(delta)
-		# Touching the top of the screen costs a life
-		if ball.position.y <= Ball.RADIUS:
-			_lose_life()
 
-	queue_redraw()              # redraws the steer buttons
+	_keep_ball_on_screen()      # always runs last, so the ball is never left off screen
+
+	queue_redraw()
 	_update_hud()
+
+# The ball must always be on screen.
+# Above the top: lose a life (if allowed) and replace the ball.
+# Far below the bottom (should never happen, the floor catches it): replace the ball.
+func _keep_ball_on_screen() -> void:
+	if state != "play":
+		return
+	if ball.position.y <= Ball.RADIUS:
+		_lose_life()
+	elif ball.position.y > H + 200.0:
+		_respawn_ball()
 
 func _draw() -> void:
 	# Faint steer buttons, only in Buttons mode during play
@@ -216,13 +225,15 @@ func _held_in(rect: Rect2) -> bool:
 			return true
 	return false
 
-# Decide whether the ball is stuck against a bar
+# Decide whether the ball is stuck against a bar.
+# Pinning works at any height, so a bar that catches the ball can't carry it
+# to the ceiling unpinned.
 func _check_wedge(delta: float) -> void:
 	grace_timer = max(0.0, grace_timer - delta)
 	var touching := _touching_bar()
 	var stuck := PinballLogic.is_stuck_motion(
 		ball.linear_velocity, current_scroll_speed, WEDGE_SPEED)
-	var can_pin := grace_timer <= 0.0 and ball.position.y >= PIN_MIN_Y
+	var can_pin := grace_timer <= 0.0
 	wedge_timer = PinballLogic.next_wedge_timer(wedge_timer, delta, touching, stuck, can_pin)
 	if PinballLogic.should_pin(wedge_timer, WEDGE_TIME):
 		ball.attach()
@@ -260,25 +271,50 @@ func _break_free() -> void:
 	grace_timer = GRACE_TIME
 	break_timer = 0.0
 
-# Lose a life, then respawn, or end the run on the last one
+# Take a life if the cooldown allows it. The out-of-bounds ball is always
+# replaced by a fresh one, even during cooldown.
 func _lose_life() -> void:
-	if not PinballLogic.can_lose_life(life_cooldown):
-		return
-	life_cooldown = LIFE_COOLDOWN
-	lives -= 1
-	if lives <= 0:
-		_end_run()
-		return
+	if PinballLogic.can_lose_life(life_cooldown):
+		life_cooldown = LIFE_COOLDOWN
+		lives -= 1
+		if lives <= 0:
+			_end_run()
+			return
 	_respawn_ball()
 
-# Save the best score for this mode and return to the menu
+# Save the best score for this mode, park the ball, and return to the menu
 func _end_run() -> void:
 	var mode: String = settings.mode
 	if obstacles_passed > int(settings.best[mode]):
 		settings.best[mode] = obstacles_passed
 	SettingsStore.save_settings(settings)
-	ball.attach()               # freeze the ball behind the menu
+	_park_ball()
 	_show_menu("GAME OVER\nScore: %d" % obstacles_passed)
+
+# Park the ball during menus: hidden, off screen, no collisions
+func _park_ball() -> void:
+	ball.attached = false
+	ball.freeze = true
+	ball.freeze_mode = RigidBody2D.FREEZE_MODE_KINEMATIC
+	ball.linear_velocity = Vector2.ZERO
+	ball.angular_velocity = 0.0
+	ball.position = PARK_POS
+	ball.visible = false
+	ball.collision_layer = 0
+	ball.collision_mask = 0
+
+# Remove an old ball completely: no collisions, hidden, then freed.
+# Nothing from its old physics state can touch the new ball.
+func _retire_ball(old: Ball) -> void:
+	old.attached = false
+	old.freeze = true
+	old.freeze_mode = RigidBody2D.FREEZE_MODE_KINEMATIC
+	old.linear_velocity = Vector2.ZERO
+	old.angular_velocity = 0.0
+	old.collision_layer = 0
+	old.collision_mask = 0
+	old.visible = false
+	old.queue_free()
 
 # Show the menu, with an optional message at the top
 func _show_menu(message: String) -> void:
@@ -370,16 +406,40 @@ func _restart() -> void:
 	current_scroll_speed = BASE_SPEED
 	_respawn_ball()
 
-# Return the ball to the start point and clear its state
+# Retire the current ball and create a fresh one at a clear spot near the start
 func _respawn_ball() -> void:
-	ball.attached = false
-	ball.freeze = false
-	ball.linear_velocity = Vector2.ZERO
-	ball.angular_velocity = 0.0
-	ball.position = BALL_START
+	if ball != null:
+		_retire_ball(ball)
+
+	ball = Ball.new()
+	ball.collision_mask = LAYER_WORLD | LAYER_BARS
+	ball.set_style(settings.ball)
+	add_child(ball)
+	ball.position = _find_clear_spawn()
+
 	wedge_timer = 0.0
 	break_timer = 0.0
 	grace_timer = GRACE_TIME
+
+# Search near BALL_START for a spot where the ball doesn't overlap any bar.
+# Tries the start point first, then nearby points. Falls back to BALL_START.
+func _find_clear_spawn() -> Vector2:
+	var space := get_world_2d().direct_space_state
+	var shape := CircleShape2D.new()
+	shape.radius = Ball.RADIUS + 6.0
+
+	var query := PhysicsShapeQueryParameters2D.new()
+	query.shape = shape
+	query.collision_mask = LAYER_BARS
+	query.exclude = [ball.get_rid()]
+
+	for dy in [0.0, 40.0, -40.0, 80.0, -80.0, 120.0, -120.0]:
+		for x in [BALL_START.x, 300.0, 780.0, 180.0, 900.0, 60.0, 1020.0]:
+			var p := Vector2(x, BALL_START.y + dy)
+			query.transform = Transform2D(0.0, p)
+			if space.intersect_shape(query, 1).is_empty():
+				return p
+	return BALL_START
 
 # Scroll chunks, count passed ones, remove old ones, add new ones below
 func _update_chunks(delta: float) -> void:
