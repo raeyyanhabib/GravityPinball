@@ -4,6 +4,7 @@ extends RigidBody2D
 const RADIUS := 20.0
 const MAX_SPEED := 900.0
 const TILT_FORCE := 600.0
+const TRAIL_LENGTH := 10        # how many past positions the trail keeps
 
 # Ball colors. Black gets a light outline so it stays visible on navy.
 const COLORS := {
@@ -16,6 +17,7 @@ const COLORS := {
 var tilt := 0.0
 var attached := false           # true while pinned to a bar
 var style := "off_white"        # set from the menu
+var trail: Array = []           # recent global positions, newest last
 
 func _ready() -> void:
 	gravity_scale = 0.3
@@ -31,6 +33,13 @@ func _ready() -> void:
 	mat.bounce = 0.4
 	mat.friction = 0.2
 	physics_material_override = mat
+
+# Record the trail every rendered frame
+func _process(_delta: float) -> void:
+	trail.append(global_position)
+	if trail.size() > TRAIL_LENGTH:
+		trail.pop_front()
+	queue_redraw()
 
 func _physics_process(_delta: float) -> void:
 	if attached:
@@ -58,6 +67,13 @@ func set_style(new_style: String) -> void:
 
 func _draw() -> void:
 	var c: Color = COLORS.get(style, COLORS["off_white"])
+
+	# Trail: older points are smaller and more transparent
+	for i in range(trail.size()):
+		var t := float(i + 1) / float(trail.size() + 1)
+		var p := to_local(trail[i])
+		draw_circle(p, RADIUS * t * 0.8, Color(c.r, c.g, c.b, t * 0.25))
+
 	draw_circle(Vector2.ZERO, RADIUS, c)
 	if style == "black":
 		draw_arc(Vector2.ZERO, RADIUS - 1.0, 0.0, TAU, 32, COLORS["silver"], 2.0)

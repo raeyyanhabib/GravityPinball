@@ -13,6 +13,16 @@ const PARK_POS := Vector2(-500, -500)   # where the ball waits while the menu is
 const DEFAULT_GRAVITY := 0.3
 const ZONE_COLORS := {0.15: "#2f5d62", 0.3: "#2a3a5c", 0.5: "#5c2f3a"}
 
+# ---- Visual style ----
+const BG_COLOR := "#0b0e17"
+const BAR_COLOR := "#2a3a5c"
+const BAR_EDGE_COLOR := "#3d4f78"
+const GLOW_COLOR := Color(0.9, 0.24, 0.24)  # red top-edge warning
+const GLOW_HEIGHT := 60.0                   # how far down the glow reaches (px)
+const GLOW_RANGE := 500.0                   # ball height where the glow starts (px)
+const PIN_COLOR := "#f6ad55"
+const LIFE_LOST_COLOR := "#e53e3e"
+
 # ---- Speed tuning ----
 const BASE_SPEED := 60.0
 const MAX_SPEED := 240.0
@@ -78,6 +88,7 @@ var ball_btn: Button
 
 func _ready() -> void:
 	randomize()
+	RenderingServer.set_default_clear_color(Color(BG_COLOR))  # navy background
 	settings = SettingsStore.load_settings()
 	_make_walls()
 
@@ -172,12 +183,20 @@ func _keep_ball_on_screen() -> void:
 	elif ball.position.y > H + 200.0:
 		_respawn_ball()
 
+# Top-edge warning glow and, in Buttons mode, the faint steer buttons
 func _draw() -> void:
-	# Faint steer buttons, only in Buttons mode during play
-	if state != "play" or settings.controls != "buttons":
+	if state != "play":
 		return
-	draw_rect(STEER_LEFT_RECT, Color(1, 1, 1, 0.08))
-	draw_rect(STEER_RIGHT_RECT, Color(1, 1, 1, 0.08))
+	# Stacked bands: the glow gets stronger as the ball nears the top
+	var near := clampf(1.0 - ball.position.y / GLOW_RANGE, 0.0, 1.0)
+	if near > 0.0:
+		for i in range(4):
+			var band_h := GLOW_HEIGHT * float(i + 1) / 4.0
+			draw_rect(Rect2(0, 0, W, band_h), Color(GLOW_COLOR, near * 0.12))
+
+	if settings.controls == "buttons":
+		draw_rect(STEER_LEFT_RECT, Color(1, 1, 1, 0.08))
+		draw_rect(STEER_RIGHT_RECT, Color(1, 1, 1, 0.08))
 
 # Steering: phone tilt, or on-screen buttons. A and D work on the laptop.
 func _read_tilt() -> void:
@@ -237,6 +256,8 @@ func _check_wedge(delta: float) -> void:
 	wedge_timer = PinballLogic.next_wedge_timer(wedge_timer, delta, touching, stuck, can_pin)
 	if PinballLogic.should_pin(wedge_timer, WEDGE_TIME):
 		ball.attach()
+		_burst(ball.position, Color(PIN_COLOR), 14)
+		Input.vibrate_handheld(30)
 		wedge_timer = 0.0
 		break_timer = 0.0
 
@@ -277,6 +298,8 @@ func _lose_life() -> void:
 	if PinballLogic.can_lose_life(life_cooldown):
 		life_cooldown = LIFE_COOLDOWN
 		lives -= 1
+		_burst(ball.position, Color(LIFE_LOST_COLOR), 24)
+		Input.vibrate_handheld(120)
 		if lives <= 0:
 			_end_run()
 			return
@@ -304,7 +327,6 @@ func _park_ball() -> void:
 	ball.collision_mask = 0
 
 # Remove an old ball completely: no collisions, hidden, then freed.
-# Nothing from its old physics state can touch the new ball.
 func _retire_ball(old: Ball) -> void:
 	old.attached = false
 	old.freeze = true
@@ -315,6 +337,25 @@ func _retire_ball(old: Ball) -> void:
 	old.collision_mask = 0
 	old.visible = false
 	old.queue_free()
+
+# A short burst of particles at a point. Removed after it finishes.
+func _burst(pos: Vector2, color: Color, amount: int) -> void:
+	var p := CPUParticles2D.new()
+	p.position = pos
+	p.amount = amount
+	p.one_shot = true
+	p.explosiveness = 1.0
+	p.lifetime = 0.6
+	p.spread = 180.0
+	p.gravity = Vector2.ZERO
+	p.initial_velocity_min = 120.0
+	p.initial_velocity_max = 260.0
+	p.scale_amount_min = 3.0
+	p.scale_amount_max = 6.0
+	p.color = color
+	add_child(p)
+	p.emitting = true
+	get_tree().create_timer(1.0).timeout.connect(p.queue_free)
 
 # Show the menu, with an optional message at the top
 func _show_menu(message: String) -> void:
@@ -373,7 +414,7 @@ func _build_menu() -> void:
 
 	status_label = Label.new()
 	status_label.add_theme_font_size_override("font_size", 40)
-	status_label.add_theme_color_override("font_color", Color("#f6ad55"))
+	status_label.add_theme_color_override("font_color", Color(PIN_COLOR))
 	status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(status_label)
 
@@ -532,17 +573,18 @@ func _spawn_chunk(y: float) -> void:
 	add_child(chunk)
 	chunks.append(chunk)
 
-# Color the bars by gravity zone
+# Color the bars by gravity zone. Edge highlights keep their own color.
 func _tint_chunk(chunk: Node2D, g: float) -> void:
-	var color: String = ZONE_COLORS.get(g, "#2a3a5c")
+	var color: String = ZONE_COLORS.get(g, BAR_COLOR)
 	for child in chunk.get_children():
-		if child is ColorRect:
+		if child is ColorRect and not child.has_meta("edge"):
 			child.color = Color(color)
 
 func _add_bar(chunk: Node2D, y: float, gap_x: float, gap_w: float) -> void:
 	_add_rect(chunk, 0.0, y, gap_x, BAR_H)
 	_add_rect(chunk, gap_x + gap_w, y, W - gap_x - gap_w, BAR_H)
 
+# One rectangle: a collision shape, a fill, and a lighter 2px top edge
 func _add_rect(parent: Node2D, x: float, y: float, w: float, h: float) -> void:
 	if w <= 0.0:
 		return
@@ -552,8 +594,16 @@ func _add_rect(parent: Node2D, x: float, y: float, w: float, h: float) -> void:
 	col.shape = shape
 	col.position = Vector2(x + w / 2.0, y + h / 2.0)
 	parent.add_child(col)
+
 	var visual := ColorRect.new()
 	visual.position = Vector2(x, y)
 	visual.size = Vector2(w, h)
-	visual.color = Color("#2a3a5c")
+	visual.color = Color(BAR_COLOR)
 	parent.add_child(visual)
+
+	var edge := ColorRect.new()
+	edge.position = Vector2(x, y)
+	edge.size = Vector2(w, 2.0)
+	edge.color = Color(BAR_EDGE_COLOR)
+	edge.set_meta("edge", true)
+	parent.add_child(edge)

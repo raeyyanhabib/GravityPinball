@@ -3,9 +3,10 @@ extends AnimatableBody2D
 
 const LEN := 150.0              # length of the flipper arm
 const THICK := 26.0             # thickness of the flipper arm
-const SWING_SPEED := 14.0       # how fast it swings (radians per second)
+const EASE_RATE := 18.0         # higher = snappier swing
 const REST_ANGLE := 0.5         # resting angle (left flipper: down-right)
 const UP_ANGLE := -0.55         # raised angle (left flipper: up-right)
+const COLOR_HEX := "#4fd1c5"
 
 var is_left := true             # which side this flipper is on
 var pressed := false            # set by main.gd when the player holds it
@@ -27,9 +28,14 @@ func _target_angle() -> float:
 	return a
 
 func _physics_process(delta: float) -> void:
-	# Swing toward the target at a fixed speed, instead of snapping
-	rotation = move_toward(rotation, _target_angle(), SWING_SPEED * delta)
-	queue_redraw()              # redraw the arm at its new angle
+	# Ease toward the target: fast start, soft landing
+	var weight := 1.0 - exp(-EASE_RATE * delta)
+	rotation = lerp_angle(rotation, _target_angle(), weight)
+	queue_redraw()
 
 func _draw() -> void:
-	draw_rect(Rect2(0.0, -THICK / 2.0, LEN, THICK), Color("#4fd1c5"))
+	var c := Color(COLOR_HEX)
+	draw_rect(Rect2(0.0, -THICK / 2.0, LEN, THICK), c)
+	# Rounded ends
+	draw_circle(Vector2.ZERO, THICK / 2.0, c)
+	draw_circle(Vector2(LEN, 0.0), THICK / 2.0, c)
