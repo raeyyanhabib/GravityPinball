@@ -11,19 +11,27 @@ const FLIPPER_Y := 1700.0
 const BALL_START := Vector2(540, 400)
 const PARK_POS := Vector2(-500, -500)   # where the ball waits while the menu is open
 const DEFAULT_GRAVITY := 0.3
-const ZONE_COLORS := {0.15: "#2f5d62", 0.3: "#2a3a5c", 0.5: "#5c2f3a"}
 const HUD_MARGIN := 30.0
 const PAUSE_BTN_SIZE := Vector2(190, 90)
+const MENU_W := 760.0                   # width of the menu card
 
 # ---- Visual style ----
 const BG_COLOR := "#0b0e17"
-const BAR_COLOR := "#2a3a5c"
-const BAR_EDGE_COLOR := "#3d4f78"
+const ZONE_COLORS := {0.15: "#2fb3a6", 0.3: "#3b82f6", 0.5: "#f04e5a"}   # teal, blue, red
+const BAR_COLOR := "#3b82f6"
 const GLOW_COLOR := Color(0.9, 0.24, 0.24)
 const GLOW_HEIGHT := 60.0
 const GLOW_RANGE := 500.0
 const PIN_COLOR := "#f6ad55"
 const LIFE_LOST_COLOR := "#e53e3e"
+const TEXT := Color("#f2f4f8")
+const MUTED := Color("#9aa3c7")
+const ACCENT := Color("#3b82f6")
+const BTN_BG := Color("#161b2b")
+const BTN_HOVER := Color("#1f2740")
+const BTN_PRESSED := Color("#0e1322")
+const BTN_BORDER := Color("#2a3350")
+const BAR_RADIUS := 8
 
 # ---- Quality ----
 const LOW_FPS := 40.0           # below this for LOW_FPS_SECONDS, switch to low effects
@@ -106,10 +114,13 @@ var break_timer := 0.0
 var life_cooldown := 0.0
 var hit_timer := 0.0
 var sfx_players := {}           # sound name -> AudioStreamPlayer
+var ui_theme: Theme
 var hud: Label
+var hud_panel: PanelContainer
 var hud_layer: CanvasLayer
 var pause_btn: Button
 var menu_layer: CanvasLayer
+var menu_card: PanelContainer
 var status_label: Label
 var best_label: Label
 var play_btn: Button
@@ -128,6 +139,7 @@ func _ready() -> void:
 	GameLog.info("Game started. Mode %s, controls %s, effects %s" % [
 		settings.mode, settings.controls, settings.effects])
 	_update_insets()
+	ui_theme = _build_theme()
 	_make_walls()
 
 	# Fill the screen, starting one chunk above the top
@@ -163,22 +175,90 @@ func _update_insets() -> void:
 		scale = 1.0
 	top_inset = float(safe.position.y) / scale
 
-# HUD text and the pause button, both placed below the notch
+# One shared theme so every button and label matches
+func _build_theme() -> Theme:
+	var t := Theme.new()
+	var font := SystemFont.new()
+	font.font_names = PackedStringArray(["Segoe UI", "Roboto", "Helvetica Neue", "Arial"])
+	font.font_weight = 600
+	t.default_font = font
+	t.default_font_size = 36
+
+	t.set_color("font_color", "Label", TEXT)
+	t.set_color("font_color", "Button", TEXT)
+	t.set_color("font_hover_color", "Button", TEXT)
+	t.set_color("font_pressed_color", "Button", TEXT)
+	t.set_font_size("font_size", "Button", 40)
+	t.set_stylebox("normal", "Button", _btn_style(BTN_BG, BTN_BORDER, 18))
+	t.set_stylebox("hover", "Button", _btn_style(BTN_HOVER, BTN_BORDER, 18))
+	t.set_stylebox("pressed", "Button", _btn_style(BTN_PRESSED, BTN_BORDER, 18))
+	t.set_stylebox("focus", "Button", StyleBoxEmpty.new())
+	return t
+
+# A rounded button background
+func _btn_style(bg: Color, border: Color, radius: int) -> StyleBoxFlat:
+	var s := StyleBoxFlat.new()
+	s.bg_color = bg
+	s.border_color = border
+	s.set_border_width_all(2)
+	s.set_corner_radius_all(radius)
+	s.content_margin_left = 24
+	s.content_margin_right = 24
+	s.content_margin_top = 14
+	s.content_margin_bottom = 14
+	return s
+
+# A rounded panel background with padding
+func _panel_style(bg: Color, border: Color, radius: int, pad_x: float, pad_y: float) -> StyleBoxFlat:
+	var s := StyleBoxFlat.new()
+	s.bg_color = bg
+	s.border_color = border
+	s.set_border_width_all(2)
+	s.set_corner_radius_all(radius)
+	s.content_margin_left = pad_x
+	s.content_margin_right = pad_x
+	s.content_margin_top = pad_y
+	s.content_margin_bottom = pad_y
+	s.shadow_color = Color(0, 0, 0, 0.45)
+	s.shadow_size = 10
+	return s
+
+# A bar block: rounded, with a lighter top edge and a soft shadow
+func _bar_style(color: Color) -> StyleBoxFlat:
+	var s := StyleBoxFlat.new()
+	s.bg_color = color
+	s.border_color = color.lightened(0.35)
+	s.border_width_top = 3
+	s.set_corner_radius_all(BAR_RADIUS)
+	s.shadow_color = Color(0, 0, 0, 0.35)
+	s.shadow_size = 4
+	s.shadow_offset = Vector2(0, 3)
+	return s
+
+# HUD stats panel, the pause button, and the pause-screen buttons
 func _build_hud() -> void:
 	hud_layer = CanvasLayer.new()
 	add_child(hud_layer)
 
+	hud_panel = PanelContainer.new()
+	hud_panel.theme = ui_theme
+	hud_panel.add_theme_stylebox_override("panel",
+		_panel_style(Color(0.04, 0.06, 0.1, 0.72), BTN_BORDER, 18, 22, 14))
+	hud_panel.position = Vector2(HUD_MARGIN, HUD_MARGIN + top_inset)
+	hud_panel.visible = false
+	hud_layer.add_child(hud_panel)
+
 	hud = Label.new()
-	hud.position = Vector2(HUD_MARGIN, HUD_MARGIN + top_inset)
-	hud.add_theme_font_size_override("font_size", 44)
-	hud.add_theme_color_override("font_color", Color("#f2f4f8"))
-	hud_layer.add_child(hud)
+	hud.add_theme_font_size_override("font_size", 40)
+	hud.add_theme_color_override("font_color", TEXT)
+	hud_panel.add_child(hud)
 
 	pause_btn = Button.new()
+	pause_btn.theme = ui_theme
 	pause_btn.text = "PAUSE"
 	pause_btn.size = PAUSE_BTN_SIZE
 	pause_btn.position = Vector2(W - PAUSE_BTN_SIZE.x - HUD_MARGIN, HUD_MARGIN + top_inset)
-	pause_btn.add_theme_font_size_override("font_size", 30)
+	pause_btn.add_theme_font_size_override("font_size", 32)
 	pause_btn.pressed.connect(_pause_game)
 	pause_btn.visible = false
 	hud_layer.add_child(pause_btn)
@@ -601,21 +681,26 @@ func _refresh_menu() -> void:
 	best_label.text = "Best (Simple): %d    Best (Hard): %d" % [
 		int(settings.best.simple), int(settings.best.hard)]
 
-# Build the menu UI once, then show or hide it
+# Build the menu once: a centred card with title, buttons, and bests
 func _build_menu() -> void:
 	menu_layer = CanvasLayer.new()
 	add_child(menu_layer)
 
+	menu_card = PanelContainer.new()
+	menu_card.theme = ui_theme
+	menu_card.add_theme_stylebox_override("panel",
+		_panel_style(Color(0.05, 0.07, 0.12, 0.94), BTN_BORDER, 28, 40, 40))
+	menu_card.position = Vector2((W - MENU_W) / 2.0, 330 + top_inset)
+	menu_layer.add_child(menu_card)
+
 	var box := VBoxContainer.new()
-	box.position = Vector2(200, 420 + top_inset)
-	box.custom_minimum_size = Vector2(680, 0)
-	box.add_theme_constant_override("separation", 20)
-	menu_layer.add_child(box)
+	box.custom_minimum_size = Vector2(MENU_W - 80, 0)
+	box.add_theme_constant_override("separation", 18)
+	menu_card.add_child(box)
 
 	var title := Label.new()
 	title.text = "GRAVITY PINBALL"
-	title.add_theme_font_size_override("font_size", 64)
-	title.add_theme_color_override("font_color", Color("#f2f4f8"))
+	title.add_theme_font_size_override("font_size", 68)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(title)
 
@@ -626,6 +711,8 @@ func _build_menu() -> void:
 	box.add_child(status_label)
 
 	play_btn = _make_button(box, "Play", _on_play)
+	play_btn.add_theme_stylebox_override("normal", _btn_style(ACCENT, ACCENT.lightened(0.25), 18))
+	play_btn.add_theme_stylebox_override("hover", _btn_style(ACCENT.lightened(0.1), ACCENT.lightened(0.35), 18))
 	quit_btn = _make_button(box, "Quit to menu", _on_quit)
 	quit_btn.visible = false
 	mode_btn = _make_button(box, "", _on_mode)
@@ -636,15 +723,14 @@ func _build_menu() -> void:
 
 	best_label = Label.new()
 	best_label.add_theme_font_size_override("font_size", 34)
-	best_label.add_theme_color_override("font_color", Color("#9aa3c7"))
+	best_label.add_theme_color_override("font_color", MUTED)
 	best_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(best_label)
 
 func _make_button(parent: Control, text: String, callback: Callable) -> Button:
 	var b := Button.new()
 	b.text = text
-	b.custom_minimum_size = Vector2(680, 96)
-	b.add_theme_font_size_override("font_size", 40)
+	b.custom_minimum_size = Vector2(MENU_W - 80, 100)
 	b.pressed.connect(func(): _play("click"))
 	b.pressed.connect(callback)
 	parent.add_child(b)
@@ -770,15 +856,18 @@ func _add_star(chunk: Node2D, pos: Vector2) -> void:
 	chunk.add_child(s)
 
 func _update_hud() -> void:
-	if state != "play":
-		hud.text = ""
+	if hud_panel == null:
 		return
+	if state != "play":
+		hud_panel.visible = false
+		return
+	hud_panel.visible = true
 	var best := int(settings.best[settings.mode])
 	var shown := int(score)
-	var text := "Speed: %d | Lives: %d\nScore: %d    Best: %d" % [
+	var text := "Speed: %d  |  Lives: %d\nScore: %d    Best: %d" % [
 		int(current_scroll_speed), lives, shown, best]
 	if shown > run_start_best:
-		text += " (NEW BEST)"
+		text += "  NEW BEST"
 	if ball.attached:
 		var window := PinballLogic.escape_window(ball.position.y, current_scroll_speed)
 		text += "\nESCAPE: %.1fs" % window
@@ -808,7 +897,7 @@ func _make_walls() -> void:
 	floor_body.position = Vector2(W / 2.0, H + 10.0)
 	add_child(floor_body)
 
-# One chunk: a random gravity zone, tinted, with up to three bar rows.
+# One chunk: a random gravity zone, colored by zone, with up to three bar rows.
 # Stars are placed afterwards at random spots, off the path too.
 func _spawn_chunk(y: float) -> void:
 	var chunk := AnimatableBody2D.new()
@@ -820,6 +909,7 @@ func _spawn_chunk(y: float) -> void:
 	var grav_choices := [0.3, 0.3, 0.15, 0.5]
 	var g: float = grav_choices[randi() % grav_choices.size()]
 	chunk.set_meta("gravity_scale", g)
+	var bar_color := Color(ZONE_COLORS.get(g, BAR_COLOR))
 
 	chunk_bars.clear()
 	var band_h := CHUNK_H / 3.0
@@ -828,10 +918,9 @@ func _spawn_chunk(y: float) -> void:
 			var row_y := band * band_h + randf_range(20.0, band_h - 20.0 - BAR_H)
 			var gap_w := randf_range(GAP_MIN, GAP_MAX)
 			var gap_x := randf_range(20.0, W - gap_w - 20.0)
-			_add_bar(chunk, row_y, gap_x, gap_w)
+			_add_bar(chunk, row_y, gap_x, gap_w, bar_color)
 
 	_place_stars(chunk)
-	_tint_chunk(chunk, g)
 	add_child(chunk)
 	chunks.append(chunk)
 
@@ -853,20 +942,13 @@ func _clear_of_bars(p: Vector2) -> bool:
 			return false
 	return true
 
-# Color the bars by gravity zone. Edge highlights keep their own color.
-func _tint_chunk(chunk: Node2D, g: float) -> void:
-	var color: String = ZONE_COLORS.get(g, BAR_COLOR)
-	for child in chunk.get_children():
-		if child is ColorRect and not child.has_meta("edge"):
-			child.color = Color(color)
+func _add_bar(chunk: Node2D, y: float, gap_x: float, gap_w: float, color: Color) -> void:
+	_add_rect(chunk, 0.0, y, gap_x, BAR_H, color)
+	_add_rect(chunk, gap_x + gap_w, y, W - gap_x - gap_w, BAR_H, color)
 
-func _add_bar(chunk: Node2D, y: float, gap_x: float, gap_w: float) -> void:
-	_add_rect(chunk, 0.0, y, gap_x, BAR_H)
-	_add_rect(chunk, gap_x + gap_w, y, W - gap_x - gap_w, BAR_H)
-
-# One rectangle: a collision shape, a fill, and a lighter 2px top edge.
+# One bar block: a collision shape plus a rounded, shaded panel.
 # The rectangle is also recorded so stars can avoid it.
-func _add_rect(parent: Node2D, x: float, y: float, w: float, h: float) -> void:
+func _add_rect(parent: Node2D, x: float, y: float, w: float, h: float, color: Color) -> void:
 	if w <= 0.0:
 		return
 	chunk_bars.append(Rect2(x, y, w, h))
@@ -877,15 +959,9 @@ func _add_rect(parent: Node2D, x: float, y: float, w: float, h: float) -> void:
 	col.position = Vector2(x + w / 2.0, y + h / 2.0)
 	parent.add_child(col)
 
-	var visual := ColorRect.new()
-	visual.position = Vector2(x, y)
-	visual.size = Vector2(w, h)
-	visual.color = Color(BAR_COLOR)
-	parent.add_child(visual)
-
-	var edge := ColorRect.new()
-	edge.position = Vector2(x, y)
-	edge.size = Vector2(w, 2.0)
-	edge.color = Color(BAR_EDGE_COLOR)
-	edge.set_meta("edge", true)
-	parent.add_child(edge)
+	var panel := Panel.new()
+	panel.position = Vector2(x, y)
+	panel.size = Vector2(w, h)
+	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_theme_stylebox_override("panel", _bar_style(color))
+	parent.add_child(panel)
