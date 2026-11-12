@@ -17,11 +17,15 @@ const ZONE_COLORS := {0.15: "#2f5d62", 0.3: "#2a3a5c", 0.5: "#5c2f3a"}
 const BG_COLOR := "#0b0e17"
 const BAR_COLOR := "#2a3a5c"
 const BAR_EDGE_COLOR := "#3d4f78"
-const GLOW_COLOR := Color(0.9, 0.24, 0.24)  # red top-edge warning
-const GLOW_HEIGHT := 60.0                   # how far down the glow reaches (px)
-const GLOW_RANGE := 500.0                   # ball height where the glow starts (px)
+const GLOW_COLOR := Color(0.9, 0.24, 0.24)
+const GLOW_HEIGHT := 60.0
+const GLOW_RANGE := 500.0
 const PIN_COLOR := "#f6ad55"
 const LIFE_LOST_COLOR := "#e53e3e"
+
+# ---- Quality ----
+const LOW_FPS := 40.0           # below this for LOW_FPS_SECONDS, switch to low effects
+const LOW_FPS_SECONDS := 3.0
 
 # ---- Speed tuning ----
 const BASE_SPEED := 60.0
@@ -32,7 +36,6 @@ const DRIVER_CAP := 180.0
 const TILT_DEAD := 0.6
 const TILT_FULL := 4.0
 const TILT_SMOOTH := 0.15
-# On-screen steer buttons, used in Buttons mode
 const STEER_LEFT_RECT := Rect2(0, 1440, 300, 200)
 const STEER_RIGHT_RECT := Rect2(780, 1440, 300, 200)
 
@@ -53,7 +56,7 @@ const LIFE_COOLDOWN := 1.0
 
 const BALL_STYLES := ["off_white", "silver", "black", "white"]
 
-# ---- Saved settings (loaded in _ready) ----
+# ---- Saved settings ----
 var settings: Dictionary = {}
 
 # ---- Game state ----
@@ -62,6 +65,8 @@ var lives := 3
 var time_played := 0.0
 var obstacles_passed := 0       # also the score
 var current_scroll_speed := BASE_SPEED
+var auto_low := false           # set when the frame rate stays low
+var slow_time := 0.0            # seconds the frame rate has been low
 
 # ---- Runtime ----
 var ball: Ball
@@ -78,18 +83,21 @@ var break_timer := 0.0
 var life_cooldown := 0.0
 var hud: Label
 var menu_layer: CanvasLayer
-var title_label: Label
 var status_label: Label
 var best_label: Label
-var play_btn: Button
 var mode_btn: Button
 var controls_btn: Button
 var ball_btn: Button
+var effects_btn: Button
+var haptics_btn: Button
 
 func _ready() -> void:
 	randomize()
-	RenderingServer.set_default_clear_color(Color(BG_COLOR))  # navy background
+	get_tree().auto_accept_quit = false   # we handle close and back ourselves
+	RenderingServer.set_default_clear_color(Color(BG_COLOR))
 	settings = SettingsStore.load_settings()
+	GameLog.info("Game started. Mode %s, controls %s, effects %s" % [
+		settings.mode, settings.controls, settings.effects])
 	_make_walls()
 
 	# Fill the screen, starting one chunk above the top
@@ -120,15 +128,38 @@ func _ready() -> void:
 	_build_menu()
 	_show_menu("")
 
+# Phone and desktop lifecycle.
+# Losing focus pauses a run. Back pauses a run, or leaves a paused run.
+# Closing the window always quits.
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST:
+		get_tree().quit()
+	elif what == NOTIFICATION_APPLICATION_FOCUS_OUT:
+		if state == "play":
+			state = "paused"
+			GameLog.info("Paused (app lost focus)")
+	elif what == NOTIFICATION_WM_GO_BACK_REQUEST:
+		if state == "play":
+			state = "paused"
+		elif state == "paused":
+			_end_run("RUN ENDED")
+		else:
+			get_tree().quit()
+
 # Touch, click, key, and pause input
 func _input(event: InputEvent) -> void:
-	# P pauses and resumes during play
+	# P toggles pause on the laptop
 	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_P:
 		if state == "play":
 			state = "paused"
 		elif state == "paused":
 			state = "play"
 		return
+
+	# Any tap resumes a paused run
+	if state == "paused" and event.is_pressed() \
+			and (event is InputEventScreenTouch or event is InputEventMouseButton):
+		state = "play"
 
 	# Track each finger, and the mouse as index -1
 	if event is InputEventScreenTouch:
@@ -146,6 +177,18 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventMouseMotion and touches.has(-1):
 		touches[-1] = event.position
 
+# Watch the frame rate during play. If it stays low, switch to low effects.
+func _process(delta: float) -> void:
+	if state != "play" or auto_low:
+		return
+	if Engine.get_frames_per_second() < LOW_FPS:
+		slow_time += delta
+		if slow_time >= LOW_FPS_SECONDS:
+			auto_low = true
+			GameLog.warning("Frame rate stayed under %d, switched to low effects" % int(LOW_FPS))
+	else:
+		slow_time = maxf(0.0, slow_time - delta)
+
 # Main loop, 60 times per second
 func _physics_process(delta: float) -> void:
 	if state != "play":
@@ -159,6 +202,7 @@ func _physics_process(delta: float) -> void:
 
 	_read_tilt()
 	_read_flippers()
+	ball.trail_length = 0 if _effects_low() else Ball.TRAIL_LENGTH
 	_update_chunks(delta)
 	ball.gravity_scale = _gravity_at_ball()
 
@@ -181,18 +225,19 @@ func _keep_ball_on_screen() -> void:
 	if ball.position.y <= Ball.RADIUS:
 		_lose_life()
 	elif ball.position.y > H + 200.0:
+		GameLog.warning("Ball fell past the floor, replacing it")
 		_respawn_ball()
 
 # Top-edge warning glow and, in Buttons mode, the faint steer buttons
 func _draw() -> void:
 	if state != "play":
 		return
-	# Stacked bands: the glow gets stronger as the ball nears the top
-	var near := clampf(1.0 - ball.position.y / GLOW_RANGE, 0.0, 1.0)
-	if near > 0.0:
-		for i in range(4):
-			var band_h := GLOW_HEIGHT * float(i + 1) / 4.0
-			draw_rect(Rect2(0, 0, W, band_h), Color(GLOW_COLOR, near * 0.12))
+	if not _effects_low():
+		var near := clampf(1.0 - ball.position.y / GLOW_RANGE, 0.0, 1.0)
+		if near > 0.0:
+			for i in range(4):
+				var band_h := GLOW_HEIGHT * float(i + 1) / 4.0
+				draw_rect(Rect2(0, 0, W, band_h), Color(GLOW_COLOR, near * 0.12))
 
 	if settings.controls == "buttons":
 		draw_rect(STEER_LEFT_RECT, Color(1, 1, 1, 0.08))
@@ -245,8 +290,7 @@ func _held_in(rect: Rect2) -> bool:
 	return false
 
 # Decide whether the ball is stuck against a bar.
-# Pinning works at any height, so a bar that catches the ball can't carry it
-# to the ceiling unpinned.
+# Pinning works at any height, so a bar can't carry the ball to the ceiling unpinned.
 func _check_wedge(delta: float) -> void:
 	grace_timer = max(0.0, grace_timer - delta)
 	var touching := _touching_bar()
@@ -256,8 +300,9 @@ func _check_wedge(delta: float) -> void:
 	wedge_timer = PinballLogic.next_wedge_timer(wedge_timer, delta, touching, stuck, can_pin)
 	if PinballLogic.should_pin(wedge_timer, WEDGE_TIME):
 		ball.attach()
+		GameLog.debug("Pinned at y=%d" % int(ball.position.y))
 		_burst(ball.position, Color(PIN_COLOR), 14)
-		Input.vibrate_handheld(30)
+		_buzz(30)
 		wedge_timer = 0.0
 		break_timer = 0.0
 
@@ -298,21 +343,25 @@ func _lose_life() -> void:
 	if PinballLogic.can_lose_life(life_cooldown):
 		life_cooldown = LIFE_COOLDOWN
 		lives -= 1
+		GameLog.warning("Life lost at y=%d, %d left" % [int(ball.position.y), lives])
 		_burst(ball.position, Color(LIFE_LOST_COLOR), 24)
-		Input.vibrate_handheld(120)
+		_buzz(120)
 		if lives <= 0:
-			_end_run()
+			_end_run("GAME OVER")
 			return
 	_respawn_ball()
 
 # Save the best score for this mode, park the ball, and return to the menu
-func _end_run() -> void:
+func _end_run(title: String) -> void:
 	var mode: String = settings.mode
-	if obstacles_passed > int(settings.best[mode]):
+	var is_new_best := obstacles_passed > int(settings.best[mode])
+	if is_new_best:
 		settings.best[mode] = obstacles_passed
 	SettingsStore.save_settings(settings)
+	GameLog.info("Run ended (%s): score %d, mode %s, new best %s" % [
+		title, obstacles_passed, mode, str(is_new_best)])
 	_park_ball()
-	_show_menu("GAME OVER\nScore: %d" % obstacles_passed)
+	_show_menu("%s\nScore: %d" % [title, obstacles_passed])
 
 # Park the ball during menus: hidden, off screen, no collisions
 func _park_ball() -> void:
@@ -326,7 +375,7 @@ func _park_ball() -> void:
 	ball.collision_layer = 0
 	ball.collision_mask = 0
 
-# Remove an old ball completely: no collisions, hidden, then freed.
+# Remove an old ball completely: no collisions, hidden, then freed
 func _retire_ball(old: Ball) -> void:
 	old.attached = false
 	old.freeze = true
@@ -338,8 +387,14 @@ func _retire_ball(old: Ball) -> void:
 	old.visible = false
 	old.queue_free()
 
+# Low effects: the game has no burst particles
+func _effects_low() -> bool:
+	return settings.effects == "low" or auto_low
+
 # A short burst of particles at a point. Removed after it finishes.
 func _burst(pos: Vector2, color: Color, amount: int) -> void:
+	if _effects_low():
+		return
 	var p := CPUParticles2D.new()
 	p.position = pos
 	p.amount = amount
@@ -356,6 +411,11 @@ func _burst(pos: Vector2, color: Color, amount: int) -> void:
 	add_child(p)
 	p.emitting = true
 	get_tree().create_timer(1.0).timeout.connect(p.queue_free)
+
+# Short vibration on phones, only when haptics are on
+func _buzz(duration_ms: int) -> void:
+	if settings.haptics:
+		Input.vibrate_handheld(duration_ms)
 
 # Show the menu, with an optional message at the top
 func _show_menu(message: String) -> void:
@@ -383,6 +443,14 @@ func _on_ball() -> void:
 	ball.set_style(settings.ball)
 	_save_and_refresh()
 
+func _on_effects() -> void:
+	settings.effects = "low" if settings.effects == "full" else "full"
+	_save_and_refresh()
+
+func _on_haptics() -> void:
+	settings.haptics = not settings.haptics
+	_save_and_refresh()
+
 func _save_and_refresh() -> void:
 	SettingsStore.save_settings(settings)
 	_refresh_menu()
@@ -391,6 +459,8 @@ func _refresh_menu() -> void:
 	mode_btn.text = "Mode: %s" % String(settings.mode).capitalize()
 	controls_btn.text = "Controls: %s" % ("Tilt" if settings.controls == "tilt" else "Buttons")
 	ball_btn.text = "Ball: %s" % String(settings.ball).replace("_", " ").capitalize()
+	effects_btn.text = "Effects: %s" % ("Full" if settings.effects == "full" else "Low")
+	haptics_btn.text = "Haptics: %s" % ("On" if settings.haptics else "Off")
 	best_label.text = "Best (Simple): %d    Best (Hard): %d" % [
 		int(settings.best.simple), int(settings.best.hard)]
 
@@ -400,17 +470,17 @@ func _build_menu() -> void:
 	add_child(menu_layer)
 
 	var box := VBoxContainer.new()
-	box.position = Vector2(200, 480)
+	box.position = Vector2(200, 420)
 	box.custom_minimum_size = Vector2(680, 0)
 	box.add_theme_constant_override("separation", 20)
 	menu_layer.add_child(box)
 
-	title_label = Label.new()
-	title_label.text = "GRAVITY PINBALL"
-	title_label.add_theme_font_size_override("font_size", 64)
-	title_label.add_theme_color_override("font_color", Color("#f2f4f8"))
-	title_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	box.add_child(title_label)
+	var title := Label.new()
+	title.text = "GRAVITY PINBALL"
+	title.add_theme_font_size_override("font_size", 64)
+	title.add_theme_color_override("font_color", Color("#f2f4f8"))
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(title)
 
 	status_label = Label.new()
 	status_label.add_theme_font_size_override("font_size", 40)
@@ -418,10 +488,12 @@ func _build_menu() -> void:
 	status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(status_label)
 
-	play_btn = _make_button(box, "Play", _on_play)
+	_make_button(box, "Play", _on_play)
 	mode_btn = _make_button(box, "", _on_mode)
 	controls_btn = _make_button(box, "", _on_controls)
 	ball_btn = _make_button(box, "", _on_ball)
+	effects_btn = _make_button(box, "", _on_effects)
+	haptics_btn = _make_button(box, "", _on_haptics)
 
 	best_label = Label.new()
 	best_label.add_theme_font_size_override("font_size", 34)
@@ -445,6 +517,7 @@ func _restart() -> void:
 	time_played = 0.0
 	obstacles_passed = 0
 	current_scroll_speed = BASE_SPEED
+	GameLog.info("Run started, mode %s" % settings.mode)
 	_respawn_ball()
 
 # Retire the current ball and create a fresh one at a clear spot near the start
@@ -457,6 +530,7 @@ func _respawn_ball() -> void:
 	ball.set_style(settings.ball)
 	add_child(ball)
 	ball.position = _find_clear_spawn()
+	GameLog.debug("Ball placed at (%d, %d)" % [int(ball.position.x), int(ball.position.y)])
 
 	wedge_timer = 0.0
 	break_timer = 0.0
@@ -480,6 +554,8 @@ func _find_clear_spawn() -> Vector2:
 			query.transform = Transform2D(0.0, p)
 			if space.intersect_shape(query, 1).is_empty():
 				return p
+
+	GameLog.warning("No clear spawn near the start, using the default point")
 	return BALL_START
 
 # Scroll chunks, count passed ones, remove old ones, add new ones below
@@ -516,7 +592,7 @@ func _update_hud() -> void:
 		hud.text = ""
 		return
 	if state == "paused":
-		hud.text = "PAUSED (press P to resume)"
+		hud.text = "PAUSED\nTap or press P to resume"
 		return
 	var text := "Lives: %d | Speed: %d | Score: %d" % [
 		lives, int(current_scroll_speed), obstacles_passed]
