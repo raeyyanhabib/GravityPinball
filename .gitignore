@@ -2,3 +2,8 @@
 *.keystore
 *.jks
 export_presets.cfg
+build/
+*.aab
+*.apk
+android/build/
+android/.gradle/

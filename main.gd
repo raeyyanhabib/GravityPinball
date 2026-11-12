@@ -12,6 +12,8 @@ const BALL_START := Vector2(540, 400)
 const PARK_POS := Vector2(-500, -500)   # where the ball waits while the menu is open
 const DEFAULT_GRAVITY := 0.3
 const ZONE_COLORS := {0.15: "#2f5d62", 0.3: "#2a3a5c", 0.5: "#5c2f3a"}
+const HUD_MARGIN := 30.0
+const PAUSE_BTN_SIZE := Vector2(190, 90)
 
 # ---- Visual style ----
 const BG_COLOR := "#0b0e17"
@@ -28,9 +30,20 @@ const LOW_FPS := 40.0           # below this for LOW_FPS_SECONDS, switch to low 
 const LOW_FPS_SECONDS := 3.0
 
 # ---- Speed tuning ----
-const BASE_SPEED := 100.0
-const MAX_SPEED := 240.0
+const BASE_SPEED := 60.0
+const MAX_SPEED := 360.0
 const DRIVER_CAP := 180.0
+
+# ---- Score ----
+const SPEED_SCORE_RATE := 0.1   # points per (px/s) per second, so faster play scores more
+const STAR_CHANCE := 0.6        # chance each star slot is filled
+const STARS_PER_CHUNK := 2      # star slots per chunk
+const STAR_CLEARANCE := 30.0    # how far a star must stay from any bar
+const STAR_WHITE := 20.0
+const STAR_GOLD := 50.0
+const STAR_BLACK := 50.0        # taken off the score, and costs a life
+const PICK_RADIUS := 42.0       # how close the ball must be to collect a star
+const BEST_SAVE_SECONDS := 2.0  # how often a new best is written to disk during a run
 
 # ---- Steering ----
 const TILT_DEAD := 0.6
@@ -54,6 +67,10 @@ const KICK_SPEED := 260.0
 const GRACE_TIME := 1.2
 const LIFE_COOLDOWN := 1.0
 
+# ---- Bar hit sound ----
+const HIT_SOUND_COOLDOWN := 0.25
+const HIT_SOUND_MIN_SPEED := 80.0
+
 const BALL_STYLES := ["off_white", "silver", "black", "white"]
 
 # ---- Saved settings ----
@@ -63,14 +80,20 @@ var settings: Dictionary = {}
 var state := "menu"             # "menu", "play", or "paused"
 var lives := 3
 var time_played := 0.0
-var obstacles_passed := 0       # also the score
+var obstacles_passed := 0       # drives the speed formula, not the score
 var current_scroll_speed := BASE_SPEED
+var score := 0.0
+var run_start_best := 0         # best for this mode when the run started
+var best_dirty := false         # a new best hasn't been written to disk yet
+var best_save_timer := 0.0
 var auto_low := false           # set when the frame rate stays low
 var slow_time := 0.0            # seconds the frame rate has been low
+var top_inset := 0.0            # space the notch takes, in game units
 
 # ---- Runtime ----
 var ball: Ball
 var chunks: Array = []
+var chunk_bars: Array = []      # Rect2 of each bar in the chunk being built
 var left_flipper: Flipper
 var right_flipper: Flipper
 var tilt_smoothed := 0.0
@@ -81,10 +104,16 @@ var wedge_timer := 0.0
 var grace_timer := 0.0
 var break_timer := 0.0
 var life_cooldown := 0.0
+var hit_timer := 0.0
+var sfx_players := {}           # sound name -> AudioStreamPlayer
 var hud: Label
+var hud_layer: CanvasLayer
+var pause_btn: Button
 var menu_layer: CanvasLayer
 var status_label: Label
 var best_label: Label
+var play_btn: Button
+var quit_btn: Button
 var mode_btn: Button
 var controls_btn: Button
 var ball_btn: Button
@@ -98,6 +127,7 @@ func _ready() -> void:
 	settings = SettingsStore.load_settings()
 	GameLog.info("Game started. Mode %s, controls %s, effects %s" % [
 		settings.mode, settings.controls, settings.effects])
+	_update_insets()
 	_make_walls()
 
 	# Fill the screen, starting one chunk above the top
@@ -119,47 +149,88 @@ func _ready() -> void:
 	right_flipper.position = Vector2(W - 200, FLIPPER_Y)
 	add_child(right_flipper)
 
-	hud = Label.new()
-	hud.position = Vector2(30, 30)
-	hud.add_theme_font_size_override("font_size", 44)
-	hud.add_theme_color_override("font_color", Color("#f2f4f8"))
-	add_child(hud)
-
+	_build_hud()
 	_build_menu()
+	_build_sounds()
 	_show_menu("")
 
+# Read the notch and status bar area so the HUD stays visible.
+# The safe area is in screen pixels, so divide by the stretch scale.
+func _update_insets() -> void:
+	var safe := DisplayServer.get_display_safe_area()
+	var scale := get_viewport().get_final_transform().get_scale().y
+	if scale <= 0.0:
+		scale = 1.0
+	top_inset = float(safe.position.y) / scale
+
+# HUD text and the pause button, both placed below the notch
+func _build_hud() -> void:
+	hud_layer = CanvasLayer.new()
+	add_child(hud_layer)
+
+	hud = Label.new()
+	hud.position = Vector2(HUD_MARGIN, HUD_MARGIN + top_inset)
+	hud.add_theme_font_size_override("font_size", 44)
+	hud.add_theme_color_override("font_color", Color("#f2f4f8"))
+	hud_layer.add_child(hud)
+
+	pause_btn = Button.new()
+	pause_btn.text = "PAUSE"
+	pause_btn.size = PAUSE_BTN_SIZE
+	pause_btn.position = Vector2(W - PAUSE_BTN_SIZE.x - HUD_MARGIN, HUD_MARGIN + top_inset)
+	pause_btn.add_theme_font_size_override("font_size", 30)
+	pause_btn.pressed.connect(_pause_game)
+	pause_btn.visible = false
+	hud_layer.add_child(pause_btn)
+
+# One short sound per event. Each has its own player, so sounds can overlap.
+func _build_sounds() -> void:
+	sfx_players = {
+		"pin": _make_player(Sfx.tone(440.0, 880.0, 0.15)),
+		"break": _make_player(Sfx.tone(660.0, 990.0, 0.12)),
+		"life": _make_player(Sfx.tone(320.0, 120.0, 0.35)),
+		"over": _make_player(Sfx.tone(260.0, 60.0, 0.8)),
+		"click": _make_player(Sfx.tone(1200.0, 1200.0, 0.04, 0.2)),
+		"star": _make_player(Sfx.tone(880.0, 1320.0, 0.12)),
+		"hit": _make_player(Sfx.tone(200.0, 160.0, 0.05, 0.15)),
+	}
+
+func _make_player(stream: AudioStream) -> AudioStreamPlayer:
+	var p := AudioStreamPlayer.new()
+	p.stream = stream
+	p.volume_db = -4.0
+	add_child(p)
+	return p
+
+func _play(sound: String) -> void:
+	if sfx_players.has(sound):
+		sfx_players[sound].play()
+
 # Phone and desktop lifecycle.
-# Losing focus pauses a run. Back pauses a run, or leaves a paused run.
-# Closing the window always quits.
+# Losing focus or pressing back pauses a run.
+# Back on the pause menu ends the run. Closing the window always quits.
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_CLOSE_REQUEST:
 		get_tree().quit()
 	elif what == NOTIFICATION_APPLICATION_FOCUS_OUT:
 		if state == "play":
-			state = "paused"
-			GameLog.info("Paused (app lost focus)")
+			_pause_game()
 	elif what == NOTIFICATION_WM_GO_BACK_REQUEST:
 		if state == "play":
-			state = "paused"
+			_pause_game()
 		elif state == "paused":
-			_end_run("RUN ENDED")
+			_on_quit()
 		else:
 			get_tree().quit()
 
-# Touch, click, key, and pause input
+# Touch tracking and the P key
 func _input(event: InputEvent) -> void:
-	# P toggles pause on the laptop
 	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_P:
 		if state == "play":
-			state = "paused"
+			_pause_game()
 		elif state == "paused":
-			state = "play"
+			_resume()
 		return
-
-	# Any tap resumes a paused run
-	if state == "paused" and event.is_pressed() \
-			and (event is InputEventScreenTouch or event is InputEventMouseButton):
-		state = "play"
 
 	# Track each finger, and the mouse as index -1
 	if event is InputEventScreenTouch:
@@ -199,6 +270,8 @@ func _physics_process(delta: float) -> void:
 	life_cooldown = max(0.0, life_cooldown - delta)
 	current_scroll_speed = PinballLogic.speed_for(
 		time_played, obstacles_passed, BASE_SPEED, MAX_SPEED, DRIVER_CAP)
+	score += current_scroll_speed * delta * SPEED_SCORE_RATE
+	_update_best(delta)
 
 	_read_tilt()
 	_read_flippers()
@@ -210,11 +283,25 @@ func _physics_process(delta: float) -> void:
 		_carry_ball(delta)
 	else:
 		_check_wedge(delta)
+		_check_bar_hit(delta)
 
+	_collect_stars()
 	_keep_ball_on_screen()      # always runs last, so the ball is never left off screen
 
 	queue_redraw()
 	_update_hud()
+
+# Keep the saved best up to date during a run, written at most every BEST_SAVE_SECONDS
+func _update_best(delta: float) -> void:
+	var now := int(score)
+	if now > int(settings.best[settings.mode]):
+		settings.best[settings.mode] = now
+		best_dirty = true
+	best_save_timer = maxf(0.0, best_save_timer - delta)
+	if best_dirty and best_save_timer <= 0.0:
+		SettingsStore.save_settings(settings)
+		best_dirty = false
+		best_save_timer = BEST_SAVE_SECONDS
 
 # The ball must always be on screen.
 # Above the top: lose a life (if allowed) and replace the ball.
@@ -267,11 +354,14 @@ func _read_tilt() -> void:
 	ball.tilt = tilt_smoothed
 
 # Flippers: Z and / on the laptop, screen halves on touch.
-# In Buttons mode, touches on the steer buttons don't flip.
+# Touches on the steer buttons or the pause button don't flip.
 func _read_flippers() -> void:
 	left_down = Input.is_physical_key_pressed(KEY_Z)
 	right_down = Input.is_physical_key_pressed(KEY_SLASH)
+	var pause_rect := Rect2(pause_btn.position, PAUSE_BTN_SIZE)
 	for pos in touches.values():
+		if pause_rect.has_point(pos):
+			continue
 		if settings.controls == "buttons":
 			if STEER_LEFT_RECT.has_point(pos) or STEER_RIGHT_RECT.has_point(pos):
 				continue
@@ -303,8 +393,16 @@ func _check_wedge(delta: float) -> void:
 		GameLog.debug("Pinned at y=%d" % int(ball.position.y))
 		_burst(ball.position, Color(PIN_COLOR), 14)
 		_buzz(30)
+		_play("pin")
 		wedge_timer = 0.0
 		break_timer = 0.0
+
+# A thud when the ball hits a bar hard, with a cooldown so it doesn't repeat every frame
+func _check_bar_hit(delta: float) -> void:
+	hit_timer = maxf(0.0, hit_timer - delta)
+	if hit_timer <= 0.0 and ball.linear_velocity.length() > HIT_SOUND_MIN_SPEED and _touching_bar():
+		_play("hit")
+		hit_timer = HIT_SOUND_COOLDOWN
 
 func _touching_bar() -> bool:
 	for b in ball.get_colliding_bodies():
@@ -336,6 +434,7 @@ func _break_free() -> void:
 	ball.release(Vector2(dir * KICK_SPEED, 60.0))
 	grace_timer = GRACE_TIME
 	break_timer = 0.0
+	_play("break")
 
 # Take a life if the cooldown allows it. The out-of-bounds ball is always
 # replaced by a fresh one, even during cooldown.
@@ -347,21 +446,52 @@ func _lose_life() -> void:
 		_burst(ball.position, Color(LIFE_LOST_COLOR), 24)
 		_buzz(120)
 		if lives <= 0:
+			_play("over")
 			_end_run("GAME OVER")
 			return
+		_play("life")
 	_respawn_ball()
 
 # Save the best score for this mode, park the ball, and return to the menu
 func _end_run(title: String) -> void:
 	var mode: String = settings.mode
-	var is_new_best := obstacles_passed > int(settings.best[mode])
-	if is_new_best:
-		settings.best[mode] = obstacles_passed
+	var final_score := int(score)
+	var is_new_best := final_score > run_start_best
+	if final_score > int(settings.best[mode]):
+		settings.best[mode] = final_score
 	SettingsStore.save_settings(settings)
+	best_dirty = false
 	GameLog.info("Run ended (%s): score %d, mode %s, new best %s" % [
-		title, obstacles_passed, mode, str(is_new_best)])
+		title, final_score, mode, str(is_new_best)])
 	_park_ball()
-	_show_menu("%s\nScore: %d" % [title, obstacles_passed])
+	var message := "%s\nScore: %d" % [title, final_score]
+	if is_new_best:
+		message += "\nNEW BEST!"
+	_show_menu(message)
+
+# Pause from the button, the P key, focus loss, or back.
+# The pause menu shows Resume and Quit to menu.
+func _pause_game() -> void:
+	if state != "play":
+		return
+	state = "paused"
+	pause_btn.visible = false
+	GameLog.info("Paused")
+	status_label.text = "PAUSED"
+	play_btn.text = "Resume"
+	quit_btn.visible = true
+	_refresh_menu()
+	menu_layer.visible = true
+
+func _resume() -> void:
+	state = "play"
+	menu_layer.visible = false
+	pause_btn.visible = true
+	GameLog.info("Resumed")
+
+# Quit a paused run back to the main menu
+func _on_quit() -> void:
+	_end_run("RUN ENDED")
 
 # Park the ball during menus: hidden, off screen, no collisions
 func _park_ball() -> void:
@@ -417,16 +547,23 @@ func _buzz(duration_ms: int) -> void:
 	if settings.haptics:
 		Input.vibrate_handheld(duration_ms)
 
-# Show the menu, with an optional message at the top
+# Show the main menu, with an optional message at the top
 func _show_menu(message: String) -> void:
 	state = "menu"
 	menu_layer.visible = true
+	pause_btn.visible = false
 	status_label.text = message
+	play_btn.text = "Play"
+	quit_btn.visible = false
 	_refresh_menu()
 
 func _on_play() -> void:
+	if state == "paused":
+		_resume()
+		return
 	menu_layer.visible = false
 	state = "play"
+	pause_btn.visible = true
 	_restart()
 
 func _on_mode() -> void:
@@ -470,7 +607,7 @@ func _build_menu() -> void:
 	add_child(menu_layer)
 
 	var box := VBoxContainer.new()
-	box.position = Vector2(200, 420)
+	box.position = Vector2(200, 420 + top_inset)
 	box.custom_minimum_size = Vector2(680, 0)
 	box.add_theme_constant_override("separation", 20)
 	menu_layer.add_child(box)
@@ -488,7 +625,9 @@ func _build_menu() -> void:
 	status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(status_label)
 
-	_make_button(box, "Play", _on_play)
+	play_btn = _make_button(box, "Play", _on_play)
+	quit_btn = _make_button(box, "Quit to menu", _on_quit)
+	quit_btn.visible = false
 	mode_btn = _make_button(box, "", _on_mode)
 	controls_btn = _make_button(box, "", _on_controls)
 	ball_btn = _make_button(box, "", _on_ball)
@@ -506,6 +645,7 @@ func _make_button(parent: Control, text: String, callback: Callable) -> Button:
 	b.text = text
 	b.custom_minimum_size = Vector2(680, 96)
 	b.add_theme_font_size_override("font_size", 40)
+	b.pressed.connect(func(): _play("click"))
 	b.pressed.connect(callback)
 	parent.add_child(b)
 	return b
@@ -517,6 +657,11 @@ func _restart() -> void:
 	time_played = 0.0
 	obstacles_passed = 0
 	current_scroll_speed = BASE_SPEED
+	score = 0.0
+	run_start_best = int(settings.best[settings.mode])
+	best_dirty = false
+	best_save_timer = 0.0
+	hit_timer = 0.0
 	GameLog.info("Run started, mode %s" % settings.mode)
 	_respawn_ball()
 
@@ -587,15 +732,53 @@ func _gravity_at_ball() -> float:
 		zones.append({"y": c.position.y, "g": c.get_meta("gravity_scale")})
 	return PinballLogic.gravity_at(ball.position.y, zones, CHUNK_H, DEFAULT_GRAVITY)
 
+# Collect any star the ball is touching
+func _collect_stars() -> void:
+	for c in chunks:
+		for s in c.get_children():
+			if s is Star and ball.global_position.distance_to(s.global_position) < PICK_RADIUS:
+				_collect_star(s)
+
+# White and gold add score. Black takes score away and costs a life.
+func _collect_star(star: Star) -> void:
+	if star.kind == "black":
+		score = maxf(0.0, score - STAR_BLACK)
+		GameLog.info("Black star hit, -%d score" % int(STAR_BLACK))
+		_burst(star.global_position, Color(LIFE_LOST_COLOR), 16)
+		star.queue_free()
+		_lose_life()
+	else:
+		var gain := STAR_GOLD if star.kind == "gold" else STAR_WHITE
+		score += gain
+		_burst(star.global_position, Star.COLORS[star.kind], 10)
+		_play("star")
+		star.queue_free()
+
+# Pick a star kind: 60% white, 25% gold, 15% black
+func _pick_star_kind() -> String:
+	var roll := randf()
+	if roll < 0.15:
+		return "black"
+	if roll < 0.4:
+		return "gold"
+	return "white"
+
+func _add_star(chunk: Node2D, pos: Vector2) -> void:
+	var s := Star.new()
+	s.kind = _pick_star_kind()
+	s.position = pos
+	chunk.add_child(s)
+
 func _update_hud() -> void:
-	if state == "menu":
+	if state != "play":
 		hud.text = ""
 		return
-	if state == "paused":
-		hud.text = "PAUSED\nTap or press P to resume"
-		return
-	var text := "Lives: %d | Speed: %d | Score: %d" % [
-		lives, int(current_scroll_speed), obstacles_passed]
+	var best := int(settings.best[settings.mode])
+	var shown := int(score)
+	var text := "Speed: %d | Lives: %d\nScore: %d    Best: %d" % [
+		int(current_scroll_speed), lives, shown, best]
+	if shown > run_start_best:
+		text += " (NEW BEST)"
 	if ball.attached:
 		var window := PinballLogic.escape_window(ball.position.y, current_scroll_speed)
 		text += "\nESCAPE: %.1fs" % window
@@ -625,7 +808,8 @@ func _make_walls() -> void:
 	floor_body.position = Vector2(W / 2.0, H + 10.0)
 	add_child(floor_body)
 
-# One chunk: a random gravity zone, tinted, with up to three bar rows
+# One chunk: a random gravity zone, tinted, with up to three bar rows.
+# Stars are placed afterwards at random spots, off the path too.
 func _spawn_chunk(y: float) -> void:
 	var chunk := AnimatableBody2D.new()
 	chunk.position = Vector2(0, y)
@@ -637,6 +821,7 @@ func _spawn_chunk(y: float) -> void:
 	var g: float = grav_choices[randi() % grav_choices.size()]
 	chunk.set_meta("gravity_scale", g)
 
+	chunk_bars.clear()
 	var band_h := CHUNK_H / 3.0
 	for band in range(3):
 		if randf() < 0.8:
@@ -645,9 +830,28 @@ func _spawn_chunk(y: float) -> void:
 			var gap_x := randf_range(20.0, W - gap_w - 20.0)
 			_add_bar(chunk, row_y, gap_x, gap_w)
 
+	_place_stars(chunk)
 	_tint_chunk(chunk, g)
 	add_child(chunk)
 	chunks.append(chunk)
+
+# Put stars at random spots in the chunk, including off the path.
+# A spot is skipped if it sits on a bar, so the player has to go out of their way to reach it.
+func _place_stars(chunk: Node2D) -> void:
+	for i in range(STARS_PER_CHUNK):
+		if randf() > STAR_CHANCE:
+			continue
+		for attempt in range(12):
+			var p := Vector2(randf_range(40.0, W - 40.0), randf_range(20.0, CHUNK_H - 20.0))
+			if _clear_of_bars(p):
+				_add_star(chunk, p)
+				break
+
+func _clear_of_bars(p: Vector2) -> bool:
+	for r in chunk_bars:
+		if r.grow(STAR_CLEARANCE).has_point(p):
+			return false
+	return true
 
 # Color the bars by gravity zone. Edge highlights keep their own color.
 func _tint_chunk(chunk: Node2D, g: float) -> void:
@@ -660,10 +864,12 @@ func _add_bar(chunk: Node2D, y: float, gap_x: float, gap_w: float) -> void:
 	_add_rect(chunk, 0.0, y, gap_x, BAR_H)
 	_add_rect(chunk, gap_x + gap_w, y, W - gap_x - gap_w, BAR_H)
 
-# One rectangle: a collision shape, a fill, and a lighter 2px top edge
+# One rectangle: a collision shape, a fill, and a lighter 2px top edge.
+# The rectangle is also recorded so stars can avoid it.
 func _add_rect(parent: Node2D, x: float, y: float, w: float, h: float) -> void:
 	if w <= 0.0:
 		return
+	chunk_bars.append(Rect2(x, y, w, h))
 	var shape := RectangleShape2D.new()
 	shape.size = Vector2(w, h)
 	var col := CollisionShape2D.new()
