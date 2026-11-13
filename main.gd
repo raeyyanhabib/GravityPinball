@@ -13,7 +13,12 @@ const PARK_POS := Vector2(-500, -500)   # where the ball waits while the menu is
 const DEFAULT_GRAVITY := 0.3
 const HUD_MARGIN := 30.0
 const PAUSE_BTN_SIZE := Vector2(190, 90)
-const MENU_W := 760.0                   # width of the menu card
+const MENU_W := 760.0                   # width of the main menu card
+const PAUSE_W := 520.0                  # width of the pause card
+
+# ---- Fonts (files in the project root) ----
+const FONT_REGULAR_PATH := "res://redaction50.ttf"
+const FONT_BOLD_PATH := "res://redaction50bold.ttf"
 
 # ---- Visual style ----
 const BG_COLOR := "#0b0e17"
@@ -114,6 +119,8 @@ var break_timer := 0.0
 var life_cooldown := 0.0
 var hit_timer := 0.0
 var sfx_players := {}           # sound name -> AudioStreamPlayer
+var font_regular: FontFile
+var font_bold: FontFile
 var ui_theme: Theme
 var hud: Label
 var hud_panel: PanelContainer
@@ -121,10 +128,11 @@ var hud_layer: CanvasLayer
 var pause_btn: Button
 var menu_layer: CanvasLayer
 var menu_card: PanelContainer
+var pause_layer: CanvasLayer
+var pause_card: PanelContainer
 var status_label: Label
 var best_label: Label
 var play_btn: Button
-var quit_btn: Button
 var mode_btn: Button
 var controls_btn: Button
 var ball_btn: Button
@@ -139,6 +147,7 @@ func _ready() -> void:
 	GameLog.info("Game started. Mode %s, controls %s, effects %s" % [
 		settings.mode, settings.controls, settings.effects])
 	_update_insets()
+	_load_fonts()
 	ui_theme = _build_theme()
 	_make_walls()
 
@@ -163,6 +172,7 @@ func _ready() -> void:
 
 	_build_hud()
 	_build_menu()
+	_build_pause()
 	_build_sounds()
 	_show_menu("")
 
@@ -175,19 +185,26 @@ func _update_insets() -> void:
 		scale = 1.0
 	top_inset = float(safe.position.y) / scale
 
+# Load the two font files from the project root
+func _load_fonts() -> void:
+	font_regular = load(FONT_REGULAR_PATH) as FontFile
+	font_bold = load(FONT_BOLD_PATH) as FontFile
+	if font_regular == null or font_bold == null:
+		GameLog.error("Could not load the font files from the project root")
+
 # One shared theme so every button and label matches
 func _build_theme() -> Theme:
 	var t := Theme.new()
-	var font := SystemFont.new()
-	font.font_names = PackedStringArray(["Segoe UI", "Roboto", "Helvetica Neue", "Arial"])
-	font.font_weight = 600
-	t.default_font = font
+	if font_regular != null:
+		t.default_font = font_regular
 	t.default_font_size = 36
 
 	t.set_color("font_color", "Label", TEXT)
 	t.set_color("font_color", "Button", TEXT)
 	t.set_color("font_hover_color", "Button", TEXT)
 	t.set_color("font_pressed_color", "Button", TEXT)
+	if font_bold != null:
+		t.set_font("font", "Button", font_bold)
 	t.set_font_size("font_size", "Button", 40)
 	t.set_stylebox("normal", "Button", _btn_style(BTN_BG, BTN_BORDER, 18))
 	t.set_stylebox("hover", "Button", _btn_style(BTN_HOVER, BTN_BORDER, 18))
@@ -235,7 +252,7 @@ func _bar_style(color: Color) -> StyleBoxFlat:
 	s.shadow_offset = Vector2(0, 3)
 	return s
 
-# HUD stats panel, the pause button, and the pause-screen buttons
+# HUD stats panel and the pause button
 func _build_hud() -> void:
 	hud_layer = CanvasLayer.new()
 	add_child(hud_layer)
@@ -549,23 +566,19 @@ func _end_run(title: String) -> void:
 		message += "\nNEW BEST!"
 	_show_menu(message)
 
-# Pause from the button, the P key, focus loss, or back.
-# The pause menu shows Resume and Quit to menu.
+# Open the pause card over the game. The run freezes until resumed.
 func _pause_game() -> void:
 	if state != "play":
 		return
 	state = "paused"
 	pause_btn.visible = false
 	GameLog.info("Paused")
-	status_label.text = "PAUSED"
-	play_btn.text = "Resume"
-	quit_btn.visible = true
-	_refresh_menu()
-	menu_layer.visible = true
+	pause_layer.visible = true
 
+# Close the pause card and carry on from where the run stopped
 func _resume() -> void:
 	state = "play"
-	menu_layer.visible = false
+	pause_layer.visible = false
 	pause_btn.visible = true
 	GameLog.info("Resumed")
 
@@ -631,16 +644,13 @@ func _buzz(duration_ms: int) -> void:
 func _show_menu(message: String) -> void:
 	state = "menu"
 	menu_layer.visible = true
+	pause_layer.visible = false
 	pause_btn.visible = false
 	status_label.text = message
 	play_btn.text = "Play"
-	quit_btn.visible = false
 	_refresh_menu()
 
 func _on_play() -> void:
-	if state == "paused":
-		_resume()
-		return
 	menu_layer.visible = false
 	state = "play"
 	pause_btn.visible = true
@@ -681,7 +691,7 @@ func _refresh_menu() -> void:
 	best_label.text = "Best (Simple): %d    Best (Hard): %d" % [
 		int(settings.best.simple), int(settings.best.hard)]
 
-# Build the menu once: a centred card with title, buttons, and bests
+# Build the main menu once: a centred card with title, options, and bests
 func _build_menu() -> void:
 	menu_layer = CanvasLayer.new()
 	add_child(menu_layer)
@@ -701,6 +711,8 @@ func _build_menu() -> void:
 	var title := Label.new()
 	title.text = "GRAVITY PINBALL"
 	title.add_theme_font_size_override("font_size", 68)
+	if font_bold != null:
+		title.add_theme_font_override("font", font_bold)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(title)
 
@@ -713,8 +725,6 @@ func _build_menu() -> void:
 	play_btn = _make_button(box, "Play", _on_play)
 	play_btn.add_theme_stylebox_override("normal", _btn_style(ACCENT, ACCENT.lightened(0.25), 18))
 	play_btn.add_theme_stylebox_override("hover", _btn_style(ACCENT.lightened(0.1), ACCENT.lightened(0.35), 18))
-	quit_btn = _make_button(box, "Quit to menu", _on_quit)
-	quit_btn.visible = false
 	mode_btn = _make_button(box, "", _on_mode)
 	controls_btn = _make_button(box, "", _on_controls)
 	ball_btn = _make_button(box, "", _on_ball)
@@ -726,6 +736,47 @@ func _build_menu() -> void:
 	best_label.add_theme_color_override("font_color", MUTED)
 	best_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	box.add_child(best_label)
+
+# The pause card: only Resume and Quit to menu, almost see-through so the run shows behind it
+func _build_pause() -> void:
+	pause_layer = CanvasLayer.new()
+	pause_layer.visible = false
+	add_child(pause_layer)
+
+	pause_card = PanelContainer.new()
+	pause_card.theme = ui_theme
+	pause_card.add_theme_stylebox_override("panel",
+		_panel_style(Color(0.03, 0.05, 0.09, 0.35), Color(0.3, 0.36, 0.5, 0.4), 28, 36, 32))
+	pause_card.position = Vector2((W - PAUSE_W) / 2.0, 760 + top_inset)
+	pause_layer.add_child(pause_card)
+
+	var box := VBoxContainer.new()
+	box.custom_minimum_size = Vector2(PAUSE_W - 72, 0)
+	box.add_theme_constant_override("separation", 14)
+	pause_card.add_child(box)
+
+	var heading := Label.new()
+	heading.text = "PAUSED"
+	heading.add_theme_font_size_override("font_size", 52)
+	heading.add_theme_color_override("font_color", Color(PIN_COLOR))
+	if font_bold != null:
+		heading.add_theme_font_override("font", font_bold)
+	heading.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(heading)
+
+	var resume_btn := _make_button(box, "Resume", _resume)
+	resume_btn.custom_minimum_size = Vector2(PAUSE_W - 72, 84)
+	_soft_button(resume_btn)
+
+	var quit_btn := _make_button(box, "Quit to menu", _on_quit)
+	quit_btn.custom_minimum_size = Vector2(PAUSE_W - 72, 84)
+	_soft_button(quit_btn)
+
+# Translucent button look for the pause card
+func _soft_button(b: Button) -> void:
+	b.add_theme_stylebox_override("normal", _btn_style(Color(0.1, 0.13, 0.2, 0.45), Color(0.3, 0.36, 0.5, 0.5), 18))
+	b.add_theme_stylebox_override("hover", _btn_style(Color(0.13, 0.17, 0.27, 0.6), Color(0.3, 0.36, 0.5, 0.6), 18))
+	b.add_theme_stylebox_override("pressed", _btn_style(Color(0.05, 0.07, 0.12, 0.6), Color(0.3, 0.36, 0.5, 0.6), 18))
 
 func _make_button(parent: Control, text: String, callback: Callable) -> Button:
 	var b := Button.new()
