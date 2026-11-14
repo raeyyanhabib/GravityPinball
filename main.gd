@@ -43,7 +43,7 @@ const LOW_FPS := 40.0           # below this for LOW_FPS_SECONDS, switch to low 
 const LOW_FPS_SECONDS := 3.0
 
 # ---- Speed tuning ----
-const BASE_SPEED := 60.0
+const BASE_SPEED := 90.0
 const MAX_SPEED := 360.0
 const DRIVER_CAP := 180.0
 

@@ -13,6 +13,7 @@ config_version=5
 config/name="GravityPinball"
 run/main_scene="uid://ififewhfgfsd"
 config/features=PackedStringArray("4.7", "GL Compatibility")
+boot_splash/bg_color=Color(0.055649184, 0.08042968, 0.106639154, 1)
 config/icon="uid://4b336qas80sq"
 
 [display]
